@@ -41,6 +41,7 @@ FENCE_KEY_REMOTE := /etc/cluster/fence_virt.key
 		ansible-deploy-vm \
 		ansible-cukinia-tests \
 		ansible-vm-migration \
+		ansible-setup-hardening \
         fence-key-gen fence-key-push fence-virtd-config fence-setup \
         help
 
@@ -176,6 +177,9 @@ ansible-setup-ceph:
 
 ansible-setup-ha:
 	cd $(ANSIBLE_REPO) && ansible-playbook -i $(CURDIR)/$(HYPERVISORS_INVENTORY) playbooks/cluster_setup_ha.yaml $(ANSIBLE_OPTS)
+
+ansible-setup-hardening:
+	cd $(ANSIBLE_REPO) && ansible-playbook -i $(CURDIR)/$(HYPERVISORS_INVENTORY) playbooks/seapath_setup_hardening.yaml $(ANSIBLE_OPTS)
 
 ansible-grow-rootfs:
 	ansible-playbook -i $(HYPERVISORS_INVENTORY) playbooks/grow-rootfs.yaml $(ANSIBLE_OPTS)
