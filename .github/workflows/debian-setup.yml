@@ -1,0 +1,293 @@
+name: debian-setup
+
+on:
+  workflow_call:
+    inputs:
+      ansible_repo:
+        description: "SEAPATH Ansible repo URL to clone"
+        required: false
+        default: "https://github.com/seapath/ansible.git"
+        type: string
+      ansible_ref:
+        description: "Branch, tag or commit of the Ansible repo to check out"
+        required: false
+        default: "main"
+        type: string
+      hypervisor_image_url:
+        description: "URL or path of the SEAPATH hypervisor image to fetch"
+        required: false
+        default: "https://releases.seapath.org/builds/test-virtual-cluster/seapath-host-efi-image-seapath-hypervisor.rootfs.wic.qcow2"
+        type: string
+      hypervisor_image_filename:
+        description: "Name of the SEAPATH hypervisor image"
+        required: false
+        default: "seapath-host-efi-image-seapath-hypervisor.rootfs.wic.qcow2"
+        type: string
+      vm_image_url:
+        description: "URL of the SEAPATH VM image to fetch"
+        required: false
+        default: "https://releases.seapath.org/builds/v2.0.0/seapath-v2.0.0-guest-efi-image.rootfs.wic.qcow2"
+        type: string
+      vm_image_filename:
+        description: "Name of the SEAPATH VM image"
+        required: false
+        default: "seapath-v2.0.0-guest-efi-image.rootfs.wic.qcow2"
+        type: string
+jobs:
+  ansible-setup:
+    runs-on: seapath-installer-builder
+    timeout-minutes: 90
+    env:
+      HYPERVISOR_INVENTORY: ${{ github.workspace }}/virtual-cluster/inventory/seapath-sandbox.yaml
+      VM_INVENTORY: ${{ github.workspace }}/virtual-cluster/inventory/seapath-test-vm.yaml
+      RESULTS_FOLDER: ${{ github.workspace }}/ansible/test_results
+      LIBVIRT_DEFAULT_URI: qemu:///system
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+      TF_CLI_ARGS_apply: "-auto-approve"
+      TF_IN_AUTOMATION: "1"
+      VIRTUAL_CLUSTER_REPO: "${{ github.workspace }}/virtual-cluster"
+      ANSIBLE_REPO: ${{ github.repository == 'seapath/ansible' && github.workspace || format('{0}/ansible', github.workspace) }}
+      HYPERVISOR_IMAGE_FILENAME: ${{ inputs.hypervisor_image_filename }}
+      VM_IMAGE_FILENAME: ${{ inputs.vm_image_filename }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout virtual-cluster
+        uses: actions/checkout@v6
+        with:
+          repository: paullgk/virtual-cluster.git
+          path: virtual-cluster
+          ref: main
+
+      - name: Install system dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-kvm qemu-utils ovmf libvirt-daemon-system libvirt-clients \
+            virtinst genisoimage \
+            dnsmasq-base \
+            openvswitch-switch \
+            python3-libvirt python3-pip python3-venv \
+            sshpass \
+            netcat-openbsd \
+            s3cmd \
+            xmlstarlet jq curl gnupg lsb-release \
+            fence-virt fence-virtd
+          # SEAPATH's prepare.sh requires ansible-core 2.16 exactly
+          python3 -m pip install --break-system-packages \
+            'ansible-core~=2.16.0' 'jmespath' 'netaddr' 'passlib'
+          wget -O- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update
+          sudo apt-get install -y terraform
+
+      - name: Enable libvirt + Open vSwitch and grant runner access
+        run: |
+          set -euxo pipefail
+          sudo systemctl enable --now libvirtd openvswitch-switch
+          sudo usermod -aG libvirt,kvm "$USER"
+          echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/ovs-vsctl, /usr/bin/ovs-ofctl" \
+            | sudo tee /etc/sudoers.d/runner-ovs
+          sudo chmod 0440 /etc/sudoers.d/runner-ovs
+          ls -l /dev/kvm
+
+      - name: Configure and start fence_virtd on CI host
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/fence
+          dd if=/dev/urandom bs=32 count=1 of=/tmp/fence/fence_virt.key
+          chmod 400 /tmp/fence/fence_virt.key
+          sudo mkdir -p /etc/cluster
+          sudo cp /tmp/fence/fence_virt.key /etc/cluster/fence_virt.key
+          sudo chmod 0400 /etc/cluster/fence_virt.key
+          cat | sudo tee /etc/fence_virt.conf <<'FENCECONF'
+          fence_virtd {
+              listener = "tcp";
+              backend = "libvirt";
+              module_path = "/usr/lib/x86_64-linux-gnu/fence-virt";
+          }
+
+          listeners {
+              tcp {
+                  key_file = "/etc/cluster/fence_virt.key";
+                  port = "1229";
+                  address = "0.0.0.0";
+                  family = "ipv4";
+              }
+          }
+
+          backends {
+              libvirt {
+                  uri = "qemu:///system";
+              }
+          }
+          FENCECONF
+          sudo ufw allow 1229/tcp || true
+          sudo systemctl enable --now fence_virtd
+          sudo systemctl status fence_virtd --no-pager
+
+      - name: Create libvirt 'default' storage pool
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /var/lib/libvirt/images
+          if ! sudo virsh pool-info default >/dev/null 2>&1; then
+            sudo virsh pool-define-as default dir --target /var/lib/libvirt/images
+            sudo virsh pool-build default
+            sudo virsh pool-start default
+            sudo virsh pool-autostart default
+          fi
+          sudo virsh pool-list --all
+
+
+      - name: Download hypervisor artifact
+        env:
+          HYPERVISOR_IMAGE_URL: ${{ inputs.hypervisor_image_url }}
+          HYPERVISOR_IMAGE_FILENAME: ${{ inputs.hypervisor_image_filename }}
+        uses: actions/download-artifact@v7
+        with:
+          name: hypervisor-image
+          path: ${{ env.VIRTUAL_CLUSTER_REPO }}/images/
+
+      - name: Download VM artifact
+        env:
+          VM_IMAGE_URL: ${{ inputs.vm_image_url }}
+          VM_IMAGE_FILENAME: ${{ inputs.vm_image_filename }}
+        uses: actions/download-artifact@v7
+        with:
+          name: vm-image
+          path: ${{ env.VIRTUAL_CLUSTER_REPO }}/images/
+
+      - name: Write terraform.tfvars
+        run: |
+          cat > $VIRTUAL_CLUSTER_REPO/terraform/terraform.tfvars <<EOF
+          base_image_path = "$VIRTUAL_CLUSTER_REPO/images/$HYPERVISOR_IMAGE_FILENAME"
+          EOF
+          cat $VIRTUAL_CLUSTER_REPO/terraform/terraform.tfvars
+
+      - name: Install SSH private key for ansible user
+        run: |
+          set -euo pipefail
+          wget https://github.com/seapath/yocto-bsp/releases/download/v1.2.1/seapath-v1.2.1-artifacts-key
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat seapath-v1.2.1-artifacts-key > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+
+      - name: Checkout ansible
+        uses: actions/checkout@v6
+        with:
+          repository: seapath/ansible.git
+          path: ansible
+          ref: ${{ inputs.ansible_ref }}
+
+      - name: Prepare SEAPATH Ansible repo
+        working-directory: ansible
+        run: |
+          set -euxo pipefail
+
+          if [ ! -d ansible ]; then
+            git clone $ANSIBLE_REPO_URL
+            cd ansible
+            git checkout $ANSIBLE_REF
+          else
+            cd $ANSIBLE_REPO
+          fi
+
+          ./prepare.sh
+
+      - name: Terraform init + apply (provision VMs)
+        run: |
+          cd $VIRTUAL_CLUSTER_REPO
+          sg libvirt -c 'make init && make apply'
+
+      - name: Start VMs and networks
+        run: |
+          cd $VIRTUAL_CLUSTER_REPO
+          sg libvirt -c 'make start'
+
+      - name: Wait for SSH on all nodes
+        run: |
+          set -euxo pipefail
+          for ip in 192.168.100.101 192.168.100.102 192.168.100.103; do
+            echo "Waiting for $ip:22..."
+            for i in $(seq 1 60); do
+              if nc -z -w 2 "$ip" 22; then
+                echo "  $ip is reachable"
+                break
+              fi
+              sleep 5
+              if [ "$i" -eq 60 ]; then
+                echo "Timed out waiting for $ip"
+                exit 1
+              fi
+            done
+            done
+
+      - name: Grow root partition and filesystem
+        working-directory: virtual-cluster
+        run: |
+          sg libvirt -c 'make ansible-grow-rootfs'
+
+      - name: ansible-ping
+        working-directory: virtual-cluster
+        run: |
+          sg libvirt -c 'make ansible-ping'
+
+      - name: ansible-setup
+        working-directory: virtual-cluster
+        run: |
+          sg libvirt -c 'make ansible-setup'
+
+      - name: Configure SEAPATH Debian hardening
+        working-directory: virtual-cluster
+        run: |
+          sg libvirt -c 'make ansible-setup-hardening'
+
+      - name: Deploy a VM in the SEAPATH cluster
+        working-directory: virtual-cluster
+        run: |
+          sg libvirt -c 'make ansible-deploy-vm'
+
+      - name: Run Cukinia tests on all hypervisor nodes
+        run: |
+          cd $VIRTUAL_CLUSTER_REPO
+          sg libvirt -c 'make ansible-cukinia-tests'
+
+      - name: Check Cukinia tests results
+        # NOTE: Tests 109, 28, 31 and 32 are not compatible in a
+        # virtualized environment, so ignore their result.
+        run: |
+          set -euxo pipefail
+          cd $ANSIBLE_REPO
+          xmlstarlet sel -t -m '//testcase[failure]' -v \
+          'concat(properties/property[@name="cukinia.id"]/@value, " | ", @classname, " | ", @name)'  -n cukinia_node*.xml | \
+          grep -Ev '^SEAPATH-(00109|00028|00031|00032|00084|00223|00033|00207|00047|00203|00198)\b' > test_results || true
+
+          if grep -qE 'SEAPATH-[0-9]{5}' test_results; then
+            echo "Cukinia test fails"
+            exit 1
+          fi
+
+      - name: Test VM migration
+        run: |
+          cd $VIRTUAL_CLUSTER_REPO
+          sg libvirt -c 'make ansible-vm-migration'
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          sudo virsh -c qemu:///system list --all
+          sudo virsh -c qemu:///system net-list --all
+          sudo ovs-vsctl show
+          sudo journalctl -u libvirtd --no-pager | tail -300
+          for n in seapath-node1 seapath-node2 seapath-node3; do
+            echo "=== $n ==="
+            sudo virsh -c qemu:///system dominfo "$n"
+          done
+          free -h
+          df -h
