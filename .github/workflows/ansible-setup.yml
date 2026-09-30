@@ -55,7 +55,7 @@ jobs:
       - name: Checkout virtual-cluster
         uses: actions/checkout@v6
         with:
-          repository: seapath/virtual-cluster.git
+          repository: paullgk/virtual-cluster.git
           path: virtual-cluster
           ref: main
 
@@ -302,15 +302,57 @@ jobs:
             --extra-vars "cukinia_test_prefix=/${{ env.RESULTS_FOLDER
             }}" \
 
-      - name: Check Cukinia tests results
+      - name: Mark incompatible Cukinia tests as skipped and check results
         working-directory: ansible
-        # NOTE: Tests 109, 28, 31 and 32 are not compatible in a
-        # virtualized environment, so ignore their result.
         run: |
           set -euxo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          skipped_ids = {
+            "SEAPATH-00109", "SEAPATH-00028", "SEAPATH-00031", "SEAPATH-00032",
+            "SEAPATH-00084", "SEAPATH-00223", "SEAPATH-00033", "SEAPATH-00207",
+            "SEAPATH-00047", "SEAPATH-00203", "SEAPATH-00198",
+          }
+
+          for path in Path(os.environ["RESULTS_FOLDER"]).glob("cukinia_node*.xml"):
+            tree = ET.parse(path)
+            root = tree.getroot()
+            converted = 0
+
+            for testcase in root.iter("testcase"):
+              properties = testcase.find("properties")
+              test_id = next(
+                  (prop.get("value") for prop in (properties if properties is not None else ())
+                 if prop.get("name") == "cukinia.id"),
+                None,
+              )
+              if test_id in skipped_ids and testcase.find("failure") is not None:
+                for failure in testcase.findall("failure"):
+                  testcase.remove(failure)
+                testcase.append(ET.Element(
+                  "skipped",
+                  {"message": "Not supported in virtualized environment"},
+                ))
+                converted += 1
+
+            for suite in root.iter("testsuite"):
+              testcases = suite.findall("testcase")
+              suite.set("failures", str(sum(case.find("failure") is not None
+                              for case in testcases)))
+              suite.set("skipped", str(sum(case.find("skipped") is not None
+                             for case in testcases)))
+
+            tree.write(path, encoding="UTF-8", xml_declaration=True)
+            print(f"Marked {converted} incompatible tests as skipped in {path}")
+
+          PY
+
           xmlstarlet sel -t -m '//testcase[failure]' -v \
-          'concat(properties/property[@name="cukinia.id"]/@value, " | ", @classname, " | ", @name)'  -n ${{ env.RESULTS_FOLDER }}/cukinia_node*.xml | \
-          grep -Ev '^SEAPATH-(00109|00028|00031|00032|00084|00223|00033|00207|00047|00203|00198)\b' > cukinia_test_results || true
+          'concat(properties/property[@name="cukinia.id"]/@value, " | ", @classname, " | ", @name)' -n \
+          ${{ env.RESULTS_FOLDER }}/cukinia_node*.xml > cukinia_test_results || true
 
           if grep -qE 'SEAPATH-[0-9]{5}' cukinia_test_results; then
             echo "::error title=Hypervisor::Test fails, see associated test report"
